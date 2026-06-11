@@ -16,8 +16,6 @@ from utils import (
     plot_diversity_snapshot,
     rayleigh_fading_branches,
 )
-
-
 def _validate_branch_arrays(received, channel):
     received = np.asarray(received, dtype=complex)
     channel = np.asarray(channel, dtype=complex)
