@@ -1,227 +1,199 @@
-"""Part 2: direct-sequence spread spectrum experiment."""
+"""
+Part 1: diversity combining experiment.
+
+Students complete SC, MRC and a BER simulation over independent Rayleigh
+flat fading branches.
+"""
 
 import numpy as np
 
 from utils import (
-    add_awgn,
-    add_narrowband_interference,
     bpsk_demodulate,
     bpsk_modulate,
     calculate_ber,
     generate_bits,
     plot_ber_curve,
-    plot_correlation_snapshot,
+    plot_diversity_snapshot,
+    rayleigh_fading_branches,
 )
 
 
-def _validate_pn_chips(pn_chips):
-    pn_chips = np.asarray(pn_chips, dtype=float)
-    if pn_chips.ndim != 1 or len(pn_chips) == 0:
-        raise ValueError('pn_chips must be a non-empty one-dimensional array')
-    if not np.all(np.isin(pn_chips, [-1, 1])):
-        raise ValueError('pn_chips must contain only +1 and -1')
-    return pn_chips
+def _validate_branch_arrays(received, channel):
+    received = np.asarray(received, dtype=complex)
+    channel = np.asarray(channel, dtype=complex)
+    if received.ndim != 2 or channel.ndim != 2:
+        raise ValueError('received and channel must be 2-D arrays: branches x symbols')
+    if received.shape != channel.shape:
+        raise ValueError('received and channel must have the same shape')
+    if received.shape[0] < 1 or received.shape[1] < 1:
+        raise ValueError('received and channel must not be empty')
+    if np.any(np.abs(channel) < 1e-12):
+        raise ValueError('channel contains near-zero coefficients')
+    return received, channel
 
 
-def generate_m_sequence(register_state, taps, length=None):
+def selection_combining(received, channel):
     """
-    Generate a bipolar m-sequence with an LFSR.
+    Selection combining for flat fading branches.
 
-    Convention:
-        register_state is listed from left to right.
-        taps are 1-based positions from left to right.
-        each clock outputs the rightmost bit, shifts right, and inserts feedback
-        at the left. The feedback bit is XOR of tapped bits.
+    Parameters:
+        received: complex array with shape (num_branches, num_symbols).
+        channel: complex channel coefficients with the same shape.
 
     Returns:
-        chips in bipolar form: bit 0 -> +1, bit 1 -> -1.
+        combined: one-dimensional equalized symbol estimates.
+
+    Requirement:
+        For each symbol, select the branch with the largest |h|^2 and divide
+        the selected received sample by its channel coefficient.
     """
-    state = np.asarray(register_state, dtype=int)
-    taps = list(taps)
-    if state.ndim != 1 or len(state) == 0:
-        raise ValueError('register_state must be a non-empty one-dimensional array')
-    if not np.all((state == 0) | (state == 1)) or not np.any(state):
-        raise ValueError('register_state must be binary and not all zeros')
-    if not taps or any(tap < 1 or tap > len(state) for tap in taps):
-        raise ValueError('taps must be valid 1-based register positions')
-    if length is None:
-        length = 2 ** len(state) - 1
-    if length <= 0:
-        raise ValueError('length must be positive')
+    received, channel = _validate_branch_arrays(received, channel)
 
-    # ---------------------- 实现开始 ----------------------
-    # 复制寄存器，避免修改输入参数
-    state = state.copy()
-    # 将1-based抽头转为0-based索引
-    tap_indices = [t - 1 for t in taps]
-    output_bits = np.zeros(length, dtype=int)
+    # 1. 计算每个分支每个符号的信道功率 |h|²
+    h_power = np.abs(channel) ** 2
+    # 2. 对每个符号（每一列）找到功率最大的分支索引
+    best_branch_idx = np.argmax(h_power, axis=0)
+    # 3. 生成符号索引，用于花式索引取出对应分支的接收信号和信道
+    symbol_indices = np.arange(received.shape[1])
+    # 4. 取出每个符号对应最强分支的接收值和信道系数，做均衡
+    selected_received = received[best_branch_idx, symbol_indices]
+    selected_channel = channel[best_branch_idx, symbol_indices]
+    combined = selected_received / selected_channel
 
-    for i in range(length):
-        # 1. 输出最右位
-        output_bits[i] = state[-1]
-        # 2. 计算反馈：抽头位置的位异或
-        feedback = np.bitwise_xor.reduce(state[tap_indices])
-        # 3. 寄存器右移
-        state[1:] = state[:-1]
-        # 4. 反馈位插入最左端
-        state[0] = feedback
-
-    # 转为双极性：0→+1，1→-1
-    return np.where(output_bits == 0, 1.0, -1.0)
-    # ---------------------- 实现结束 ----------------------
+    return combined
 
 
-def dsss_spread(bits, pn_chips):
+def maximal_ratio_combining(received, channel):
     """
-    Spread BPSK symbols with PN chips.
-
-    For each bit, map 0 -> +1 and 1 -> -1, then multiply by the whole PN
-    sequence. Output length is len(bits) * len(pn_chips).
-    """
-    bits = np.asarray(bits, dtype=int)
-    pn_chips = _validate_pn_chips(pn_chips)
-    if bits.ndim != 1 or not np.all((bits == 0) | (bits == 1)):
-        raise ValueError('bits must be a one-dimensional binary array')
-
-    # ---------------------- 实现开始 ----------------------
-    # 1. 比特转BPSK符号：0→+1，1→-1
-    symbols = np.where(bits == 0, 1.0, -1.0)
-    # 2. 每个符号乘整个PN序列：利用广播机制，(N,1) * (L,) → (N,L)，再展平
-    spread_signal = symbols[:, np.newaxis] * pn_chips
-    return spread_signal.flatten()
-    # ---------------------- 实现结束 ----------------------
-
-
-def dsss_despread(received_chips, pn_chips):
-    """
-    Despread received chips by correlation with the same PN sequence.
+    Maximal ratio combining for flat fading branches.
 
     Returns:
-        recovered bits after hard decision. Non-negative correlation -> bit 0.
+        combined = sum(conj(h_i) * r_i) / sum(|h_i|^2)
     """
-    received_chips = np.asarray(received_chips, dtype=float)
-    pn_chips = _validate_pn_chips(pn_chips)
-    if received_chips.ndim != 1 or len(received_chips) % len(pn_chips) != 0:
-        raise ValueError('received_chips length must be a multiple of PN length')
+    received, channel = _validate_branch_arrays(received, channel)
 
-    # ---------------------- 实现开始 ----------------------
-    pn_length = len(pn_chips)
-    # 1. 按扩频因子拆分，每行对应一个比特的扩频序列
-    rx_matrix = received_chips.reshape(-1, pn_length)
-    # 2. 每行与PN序列做相关（点积），得到每个比特的相关值
-    correlations = rx_matrix @ pn_chips
-    # 3. 硬判决：非负为0，负为1
-    return np.where(correlations >= 0, 0, 1)
-    # ---------------------- 实现结束 ----------------------
+    # 1. 分子：每个分支的接收信号乘以信道共轭后按符号求和
+    numerator = np.sum(np.conj(channel) * received, axis=0)
+    # 2. 分母：每个符号所有分支的信道功率和
+    total_power = np.sum(np.abs(channel) ** 2, axis=0)
+    # 3. 归一化得到合并后的均衡符号
+    combined = numerator / total_power
+
+    return combined
 
 
-def processing_gain_db(spreading_factor):
-    """Return processing gain 10*log10(spreading_factor) in dB."""
-    if spreading_factor <= 0:
-        raise ValueError('spreading_factor must be positive')
+def simulate_diversity_ber(snr_db_values, num_bits=4000, num_branches=2, seed=2026):
+    """
+    Simulate BER for no diversity, SC and MRC.
 
-    # ---------------------- 实现开始 ----------------------
-    return 10 * np.log10(spreading_factor)
-    # ---------------------- 实现结束 ----------------------
+    Returns:
+        dict with keys: '单分支', 'SC', 'MRC'. Each value is a list of BERs.
+    """
+    snr_db_values = np.asarray(snr_db_values, dtype=float)
+    if snr_db_values.ndim != 1 or len(snr_db_values) == 0:
+        raise ValueError('snr_db_values must be a non-empty one-dimensional array')
+    if num_bits <= 0 or num_branches < 2:
+        raise ValueError('num_bits must be positive and num_branches must be at least 2')
 
+    # 1. 初始化各场景的BER存储列表
+    ber_no_diversity = []  # 单分支无分集
+    ber_sc = []            # 选择合并
+    ber_mrc = []           # 最大比合并
 
-def despread_with_timing_offset(received_chips, pn_chips, max_offset):
-    """Optional: search timing offset by maximum correlation magnitude."""
-    if max_offset < 0:
-        raise ValueError('max_offset must be non-negative')
+    # 2. 生成固定的发送比特和调制符号，保证仿真可复现
+    bits = generate_bits(num_bits, seed=seed)
+    tx_symbols = bpsk_modulate(bits)
 
-    # ---------------------- 选做实现开始 ----------------------
-    pn_length = len(pn_chips)
-    # 边界校验：保证至少有一个完整的PN序列可处理
-    max_valid_offset = min(max_offset, len(received_chips) - pn_length)
-    if max_valid_offset < 0:
-        raise ValueError("Received signal is too short for the given max offset")
-
-    best_corr_score = -np.inf
-    best_offset = 0
-
-    # 遍历所有可能的偏移，找相关峰值最大的同步点
-    for offset in range(max_valid_offset + 1):
-        # 取当前偏移下、长度为PN整数倍的有效信号
-        valid_length = (len(received_chips) - offset) // pn_length * pn_length
-        rx_slice = received_chips[offset : offset + valid_length]
-        # 计算相关值的绝对值之和，越大说明同步度越高
-        rx_mat = rx_slice.reshape(-1, pn_length)
-        curr_correlations = rx_mat @ pn_chips
-        curr_score = np.sum(np.abs(curr_correlations))
-        # 更新最佳偏移
-        if curr_score > best_corr_score:
-            best_corr_score = curr_score
-            best_offset = offset
-
-    # 用最佳偏移截取信号，复用已实现的解扩逻辑得到结果
-    valid_length = (len(received_chips) - best_offset) // pn_length * pn_length
-    best_rx = received_chips[best_offset : best_offset + valid_length]
-    return dsss_despread(best_rx, pn_chips)
-    # ---------------------- 选做实现结束 ----------------------
-
-
-def _correlation_values(received_chips, pn_chips):
-    matrix = np.asarray(received_chips, dtype=float).reshape(-1, len(pn_chips))
-    return matrix @ np.asarray(pn_chips, dtype=float) / len(pn_chips)
-
-
-def run_spread_spectrum_demo():
-    """Run Part 2 demo and generate figures."""
-    print('=' * 60)
-    print('Part 2: DSSS 扩频通信实验')
-    print('=' * 60)
-    snr_db_values = np.array([-6, -3, 0, 3, 6, 9], dtype=float)
-
-    try:
-        pn_chips = generate_m_sequence([1, 1, 1, 0, 1], taps=[5, 2], length=31)
-        bits = generate_bits(3000, seed=2026)
-        unspread_ber = []
-        dsss_ber = []
-
-        for index, snr_db in enumerate(snr_db_values):
-            symbols = bpsk_modulate(bits)
-            unspread_rx = add_narrowband_interference(symbols, amplitude=0.8, frequency=0.11)
-            unspread_rx = add_awgn(unspread_rx, snr_db, seed=100 + index)
-            unspread_ber.append(calculate_ber(bits, bpsk_demodulate(unspread_rx)))
-
-            chips = dsss_spread(bits, pn_chips)
-            rx_chips = add_narrowband_interference(chips, amplitude=0.8, frequency=0.11)
-            rx_chips = add_awgn(rx_chips, snr_db, seed=200 + index)
-            recovered = dsss_despread(rx_chips, pn_chips)
-            dsss_ber.append(calculate_ber(bits, recovered))
-
-        plot_ber_curve(
-            snr_db_values,
-            {'未扩频': unspread_ber, f'DSSS(N={len(pn_chips)})': dsss_ber},
-            '窄带干扰下 DSSS 扩频前后 BER 对比',
-            'dsss_ber_curve.png',
+    # 3. 遍历每个SNR点仿真
+    for snr_idx, snr_db in enumerate(snr_db_values):
+        # 生成当前SNR下的多分支瑞利衰落接收信号和信道，seed随SNR变化保证独立同分布
+        received, channel = rayleigh_fading_branches(
+            tx_symbols, num_branches, snr_db, seed=seed + snr_idx
         )
 
-        demo_bits = generate_bits(120, seed=77)
-        demo_chips = dsss_spread(demo_bits, pn_chips)
-        demo_rx = add_narrowband_interference(demo_chips, amplitude=0.8, frequency=0.11)
-        demo_rx = add_awgn(demo_rx, 0, seed=88)
-        correlations = _correlation_values(demo_rx, pn_chips)
-        plot_correlation_snapshot(correlations, 'dsss_correlation_snapshot.png')
+        # --- 单分支无分集场景：取第一个分支直接均衡 ---
+        eq_no_div = received[0] / channel[0]
+        bits_hat_no_div = bpsk_demodulate(eq_no_div)
+        ber_no_diversity.append(calculate_ber(bits, bits_hat_no_div))
 
-        print(f'[OK] 处理增益: {processing_gain_db(len(pn_chips)):.2f} dB')
-        print('[OK] 已生成 results/dsss_ber_curve.png')
-        print('[OK] 已生成 results/dsss_correlation_snapshot.png')
+        # --- 选择合并SC场景 ---
+        eq_sc = selection_combining(received, channel)
+        bits_hat_sc = bpsk_demodulate(eq_sc)
+        ber_sc.append(calculate_ber(bits, bits_hat_sc))
 
-        # ---------------------- 选做功能测试（可选打开） ----------------------
-        # # 测试同步偏移功能：给信号加3个采样的偏移，看是否能正确恢复
-        # offset_test_chips = np.concatenate([np.random.randn(3), demo_chips[:100*len(pn_chips)]])
-        # recovered_offset = despread_with_timing_offset(offset_test_chips, pn_chips, max_offset=5)
-        # offset_ber = calculate_ber(demo_bits[:len(recovered_offset)], recovered_offset)
-        # print(f'[OK] 选做同步偏移测试BER: {offset_ber:.4f}（理想应为0）')
-        # -------------------------------------------------------------------
+        # --- 最大比合并MRC场景 ---
+        eq_mrc = maximal_ratio_combining(received, channel)
+        bits_hat_mrc = bpsk_demodulate(eq_mrc)
+        ber_mrc.append(calculate_ber(bits, bits_hat_mrc))
 
+    # 4. 返回要求格式的BER字典
+    return {
+        '单分支': ber_no_diversity,
+        'SC': ber_sc,
+        'MRC': ber_mrc
+    }
+
+
+def equal_gain_combining(received, channel):
+    """Optional: equal-gain combining with phase-only correction."""
+    received, channel = _validate_branch_arrays(received, channel)
+
+    # 等增益合并逻辑：仅补偿信道相位，各分支等权重相加
+    # 1. 计算相位校正权重：信道共轭 / 信道幅度，仅保留相位补偿
+    phase_weights = np.conj(channel) / np.abs(channel)
+    # 2. 各分支相位校正后求和
+    combined_signal = np.sum(phase_weights * received, axis=0)
+    # 3. 除以各分支幅度和做均衡，得到符号估计（如果只看BER也可以省略这步，不影响符号正负判断）
+    total_amplitudes = np.sum(np.abs(channel), axis=0)
+    combined = combined_signal / total_amplitudes
+
+    return combined
+
+# ------------------------------
+# 选做扩展：如果要对比EGC性能，可以修改simulate_diversity_ber函数，新增EGC的BER统计
+# 示例修改（可选）：
+# def simulate_diversity_ber(snr_db_values, num_bits=4000, num_branches=2, seed=2026):
+#     # ... 原有逻辑不变 ...
+#     ber_egc = []
+#     for ...:
+#         # ... 原有逻辑不变 ...
+#         eq_egc = equal_gain_combining(received, channel)
+#         bits_hat_egc = bpsk_demodulate(eq_egc)
+#         ber_egc.append(calculate_ber(bits, bits_hat_egc))
+#     return {
+#         '单分支': ber_no_diversity,
+#         'SC': ber_sc,
+#         'MRC': ber_mrc,
+#         'EGC': ber_egc  # 新增EGC曲线
+#     }
+# ------------------------------
+
+
+def run_diversity_demo():
+    """Run Part 1 demo and generate figures."""
+    print('=' * 60)
+    print('Part 1: 分集合并实验')
+    print('=' * 60)
+    snr_db_values = np.array([0, 3, 6, 9, 12, 15], dtype=float)
+
+    try:
+        ber_curves = simulate_diversity_ber(snr_db_values, num_bits=6000, num_branches=2, seed=2026)
+        plot_ber_curve(snr_db_values, ber_curves, '瑞利衰落信道下分集合并 BER 对比', 'diversity_ber_curve.png')
+
+        bits = generate_bits(120, seed=7)
+        symbols = bpsk_modulate(bits)
+        received, channel = rayleigh_fading_branches(symbols, 2, snr_db=8, seed=17)
+        branch_equalized = received[0] / channel[0]
+        mrc_output = maximal_ratio_combining(received, channel)
+        plot_diversity_snapshot(symbols, branch_equalized, mrc_output, 'diversity_waveform_snapshot.png')
+
+        print('[OK] 已生成 results/diversity_ber_curve.png')
+        print('[OK] 已生成 results/diversity_waveform_snapshot.png')
     except NotImplementedError as error:
         print(f'[WAIT] 尚未完成核心函数: {error}')
     except Exception as error:
-        print(f'[FAIL] Part 2 运行失败: {error}')
+        print(f'[FAIL] Part 1 运行失败: {error}')
 
 
 if __name__ == '__main__':
-    run_spread_spectrum_demo()
+    run_diversity_demo()
